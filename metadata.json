@@ -1,6 +1,6 @@
 {
-  "name": "H2 Hub",
-  "description": "H2 Hub: المساعد الذكي الشامل والمنصة المتكاملة للذكاء الاصطناعي",
+  "name": "Hassan Personal Hub",
+  "description": "A beautiful, minimalist single-screen personal workspace hub customized for Hassan, featuring a real-time smart clock, personal task list, and a dynamic scratchpad.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

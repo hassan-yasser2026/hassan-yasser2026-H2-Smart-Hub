@@ -8,7 +8,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Initialize Google Gen AI securely on the server
 const ai = new GoogleGenAI({
@@ -23,6 +23,27 @@ const ai = new GoogleGenAI({
 // Setup express middle-wares
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+app.post("/v1beta/models/*", async (req, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({ error: "GEMINI_API_KEY is not configured." });
+  }
+
+  try {
+    const target = new URL(`https://generativelanguage.googleapis.com${req.originalUrl}`);
+    target.searchParams.set("key", process.env.GEMINI_API_KEY);
+    const upstream = await fetch(target, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    const body = await upstream.text();
+    res.status(upstream.status).type(upstream.headers.get("content-type") || "application/json").send(body);
+  } catch (error) {
+    console.error("Gemini proxy request failed:", error);
+    res.status(502).json({ error: "Unable to contact the Gemini service." });
+  }
+});
 
 // Storage folders for Cloud Sync simulation
 const SYNC_DIR = path.join(process.cwd(), "data_sync");
@@ -554,8 +575,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`H&J Smart Hub server booting successfully. Listening on port ${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
   });
 }
 

@@ -1,10 +1,14 @@
 package com.example.ui
 
+import android.Manifest
 import android.app.Application
+import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.os.Build
 import android.speech.tts.TextToSpeech
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -13,14 +17,17 @@ import android.content.Intent
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
 import com.example.network.GeminiApiClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import java.io.File
 import java.io.FileOutputStream
 import java.util.*
@@ -28,6 +35,7 @@ import java.util.*
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val TAG = "AppViewModel"
     private val context = application.applicationContext
+    private val prefs = context.getSharedPreferences("h2hub_prefs", Context.MODE_PRIVATE)
     private val database = AppDatabase.getDatabase(context)
     private val repository = AppRepository(database.appDao())
 
@@ -92,7 +100,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     // 3. AI Personas States
     val selectedPersonaId = MutableStateFlow("hasan")
-    val personaVoiceEnabled = MutableStateFlow(true)
+    // Auto-speaking personas is off: the user removed the voice toggle from the UI,
+    // so replies must never speak on their own (per-message speaker buttons remain).
+    val personaVoiceEnabled = MutableStateFlow(false)
     private val _isGeneratingPersona = MutableStateFlow(false)
     val isGeneratingPersona: StateFlow<Boolean> = _isGeneratingPersona.asStateFlow()
 
@@ -137,27 +147,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val selectedVoice = MutableStateFlow("Kore") // Default Kore (Clear female voice)
     val autoReadChatEnabled = MutableStateFlow(false) // Option to auto-read AI chat replies
 
-    // Gamification States
-    val userPoints = MutableStateFlow(240)
-    val userBadges = MutableStateFlow(mutableListOf("حل 10 مسائل 🏆", "ذاكر 5 أيام متتالية 📅"))
-    val leaderboardList = MutableStateFlow(listOf(
-        LeaderboardEntry("أحمد", 580, "عبقري H2 👑", true),
-        LeaderboardEntry("سارة", 310, "شاطر 🔥", false),
-        LeaderboardEntry("أنت (المستخدم)", 240, "شاطر 🔥", false),
-        LeaderboardEntry("كريم", 150, "مبتدئ 🌟", false)
-    ))
+    // Gamification States (persisted across app restarts)
+    val userPoints = MutableStateFlow(prefs.getInt("user_points", 240))
+    val userBadges = MutableStateFlow(loadPersistedBadges())
+    val leaderboardList = MutableStateFlow(buildLeaderboard(userPoints.value))
 
     data class LeaderboardEntry(val name: String, val points: Int, val level: String, val isTop: Boolean)
+
+    private fun loadPersistedBadges(): MutableList<String> {
+        val defaults = mutableListOf("حل 10 مسائل 🏆", "ذاكر 5 أيام متتالية 📅")
+        val json = prefs.getString("user_badges", null) ?: return defaults
+        return runCatching {
+            val arr = JSONArray(json)
+            MutableList(arr.length()) { index -> arr.getString(index) }
+        }.getOrDefault(defaults)
+    }
+
+    private fun levelForPoints(points: Int): String = when {
+        points < 200 -> "مبتدئ 🌟"
+        points in 200..500 -> "شاطر 🔥"
+        else -> "عبقري H2 👑"
+    }
+
+    private fun buildLeaderboard(points: Int): List<LeaderboardEntry> = listOf(
+        LeaderboardEntry("أحمد", 580, "عبقري H2 👑", true),
+        LeaderboardEntry("سارة", 310, "شاطر 🔥", false),
+        LeaderboardEntry("أنت (المستخدم)", points, levelForPoints(points), false),
+        LeaderboardEntry("كريم", 150, "مبتدئ 🌟", false)
+    ).sortedByDescending { it.points }
+
+    private fun persistGamification() {
+        prefs.edit()
+            .putInt("user_points", userPoints.value)
+            .putString("user_badges", JSONArray(userBadges.value).toString())
+            .apply()
+    }
 
     fun addPoints(amount: Int) {
         userPoints.value += amount
         val currentPoints = userPoints.value
-        val level = when {
-            currentPoints < 200 -> "مبتدئ 🌟"
-            currentPoints in 200..500 -> "شاطر 🔥"
-            else -> "عبقري H2 👑"
-        }
-        
+
         val currentBadges = userBadges.value.toMutableList()
         if (currentPoints >= 500 && !currentBadges.contains("عبقري متوج 👑")) {
             currentBadges.add("عبقري متوج 👑")
@@ -168,14 +197,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             userBadges.value = currentBadges
         }
 
-        val updatedList = listOf(
-            LeaderboardEntry("أحمد", 580, "عبقري H2 👑", true),
-            LeaderboardEntry("سارة", 310, "شاطر 🔥", false),
-            LeaderboardEntry("أنت (المستخدم)", currentPoints, level, false),
-            LeaderboardEntry("كريم", 150, "مبتدئ 🌟", false)
-        ).sortedByDescending { it.points }
-        
-        leaderboardList.value = updatedList
+        leaderboardList.value = buildLeaderboard(currentPoints)
+        persistGamification()
     }
 
     // 8. Voice Chat / Speech Input States
@@ -189,10 +212,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- Helper Functions & Actions ---
 
+    private var messagesCollectionJob: Job? = null
+
     fun selectSession(sessionId: String?) {
         _currentSessionId.value = sessionId
+        // Cancel the previous collector so old sessions never overwrite the visible messages
+        messagesCollectionJob?.cancel()
+        messagesCollectionJob = null
         if (sessionId != null) {
-            viewModelScope.launch {
+            messagesCollectionJob = viewModelScope.launch {
                 repository.getMessagesForSessionFlow(sessionId).collect { msgs ->
                     _currentMessages.value = msgs
                 }
@@ -252,14 +280,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 $safetySystemInstruction
             """.trimIndent()
 
-            // Call API with 1-second timeout and local fallback
-            val aiResponse = kotlinx.coroutines.withTimeoutOrNull(1000) {
+            val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
                 GeminiApiClient.generateChatResponse(
                     history = updatedList,
                     systemInstruction = systemPrompt,
                     useThinking = useThinkingMode.value
                 )
-            } ?: generateLocalFallbackResponse(text, "smart_cat")
+            } ?: "تعذر الحصول على رد خلال الوقت المتوقع. تحقق من اتصال الإنترنت وحاول مرة أخرى."
 
             // Insert AI response to database
             val modelMsg = ChatMessage(
@@ -354,6 +381,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val updatedMap = _personaMessages.value.toMutableMap()
         updatedMap[personaId] = emptyList()
         _personaMessages.value = updatedMap
+        viewModelScope.launch {
+            repository.deleteMessagesForSession("persona_$personaId")
+        }
+    }
+
+    // Load previously saved persona conversation from storage (once per persona)
+    private val loadedPersonaIds = mutableSetOf<String>()
+
+    private suspend fun loadPersonaMessagesIfNeeded(personaId: String) {
+        if (!loadedPersonaIds.add(personaId)) return
+        val stored = repository.getMessagesForSession("persona_$personaId")
+        if (stored.isNotEmpty() && _personaMessages.value[personaId].isNullOrEmpty()) {
+            val updatedMap = _personaMessages.value.toMutableMap()
+            updatedMap[personaId] = stored.sortedBy { it.timestamp }
+            _personaMessages.value = updatedMap
+        }
     }
 
     // 3. AI PERSONAS (with voice option)
@@ -368,6 +411,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
+            loadPersonaMessagesIfNeeded(personaId)
             val currentPersonaMsgs = _personaMessages.value[personaId]?.toMutableList() ?: mutableListOf()
 
             val userMsg = ChatMessage(
@@ -378,9 +422,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(userMsg)
+            repository.insertMessage(userMsg)
 
             val updatedMap = _personaMessages.value.toMutableMap()
-            updatedMap[personaId] = currentPersonaMsgs
+            updatedMap[personaId] = currentPersonaMsgs.toList()
             _personaMessages.value = updatedMap
 
             _isGeneratingPersona.value = true
@@ -396,8 +441,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             // Sentiment Analysis and Late Night detection and Search integration
             fullInstruction += detectSentimentAndInjectInstruction(text, personaId)
 
-            // Call API with 1-second timeout and local fallback
-            val aiResponse = kotlinx.coroutines.withTimeoutOrNull(1000) {
+            // Call the real AI with a generous timeout; the local canned reply is only
+            // an emergency fallback when the network is completely unavailable.
+            val aiResponse = kotlinx.coroutines.withTimeoutOrNull(90_000) {
                 GeminiApiClient.generateChatResponse(
                     history = currentPersonaMsgs,
                     systemInstruction = fullInstruction,
@@ -413,8 +459,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(modelMsg)
-            updatedMap[personaId] = currentPersonaMsgs
-            _personaMessages.value = updatedMap
+            repository.insertMessage(modelMsg)
+            val finalMap = _personaMessages.value.toMutableMap()
+            finalMap[personaId] = currentPersonaMsgs.toList()
+            _personaMessages.value = finalMap
 
             _isGeneratingPersona.value = false
 
@@ -460,7 +508,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (personaId == "hasan") {
                 builder.append("يا حسن، كن صديقاً جدعاً ومخلصاً وداعماً لأقصى درجة، وشجعه بحرارة وادعمه بكلمات جدعنة مصرية دافئة مثل: 'متقلقش يا صاحبي هنحلها وكل حاجة هتبقى تمام' بأسلوبك الأصيل لتخفف عنه وترسم الابتسامة على وجهه.")
             } else if (personaId == "jana") {
-                builder.append("يا جنى، كوني رقيقة وصبورة ومواسية له بكلمات ناعمة ودافئة ترفع معنوياته وتدعمه بقوة.")
+                builder.append("يا ريتاج، كوني رقيقة وصبورة ومواسية له بكلمات ناعمة ودافئة ترفع معنوياته وتدعمه بقوة.")
             } else {
                 builder.append("كن متعاطفاً وداعماً جداً للمستخدم في محنته.")
             }
@@ -469,7 +517,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (isHappy) {
             builder.append("\n\n[تحليل المشاعر: المستخدم سعيد ومبتهج 🎉]: ")
             if (personaId == "jana") {
-                builder.append("يا جنى، تفاعلي معه بحماس وبهجة شديدة، وهزري معاه قائلة: 'الله عالطاقة دي بقى 😂' مع إيموجي ضاحك وروح مرحة عالية جداً وتأثير مبهج.")
+                builder.append("يا ريتاج، تفاعلي معه بحماس وبهجة شديدة، وهزري معاه قائلة: 'الله عالطاقة دي بقى 😂' مع إيموجي ضاحك وروح مرحة عالية جداً وتأثير مبهج.")
             } else if (personaId == "hasan") {
                 builder.append("يا حسن، تفاعل معه برجولة وجدعنة وصاحبه الروح بالروح وشاركه الفرحة والاحتفال بحرارة.")
             } else {
@@ -541,8 +589,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun solveRecordedExplanation(text: String) {
         val personaId = selectedPersonaId.value
         viewModelScope.launch {
+            loadPersonaMessagesIfNeeded(personaId)
             val currentPersonaMsgs = _personaMessages.value[personaId]?.toMutableList() ?: mutableListOf()
-            
+
             val userMsgText = "🎙️ [شرح صوتي مسجل من المستخدم]: $text\n\nقم بتحويل هذا الشرح إلى حل نموذجي متكامل، واكتب ملخصاً صوتياً رائعاً ومبسطاً جداً له في النهاية ليقوم التطبيق بنطقه بالصوت العذب!"
             val userMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
@@ -552,6 +601,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(userMsg)
+            repository.insertMessage(userMsg)
             
             val updatedMap = _personaMessages.value.toMutableMap()
             updatedMap[personaId] = currentPersonaMsgs
@@ -576,14 +626,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(modelMsg)
+            repository.insertMessage(modelMsg)
             updatedMap[personaId] = currentPersonaMsgs
             _personaMessages.value = updatedMap
-            
+
             _isGeneratingPersona.value = false
-            
+
             // Gamification points reward
             addPoints(30)
-            
+
             speakText(aiResponse)
         }
     }
@@ -596,14 +647,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         selectedPersonaId.value = targetPersona
         
         viewModelScope.launch {
+            loadPersonaMessagesIfNeeded(targetPersona)
             val currentPersonaMsgs = _personaMessages.value[targetPersona]?.toMutableList() ?: mutableListOf()
-            
+
             val userText = if (isImage) {
                 "📸 [أرسل صورة لمسألة رياضة أو فيزياء وحلها خطوة بخطوة]"
             } else {
                 "📄 [رفع ملف PDF لتلخيصه في 5 نقاط وعمل أسئلة اختبار عليه]"
             }
-            
+
             val userMsg = ChatMessage(
                 id = UUID.randomUUID().toString(),
                 sessionId = "persona_$targetPersona",
@@ -612,6 +664,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(userMsg)
+            repository.insertMessage(userMsg)
             
             val updatedMap = _personaMessages.value.toMutableMap()
             updatedMap[targetPersona] = currentPersonaMsgs
@@ -623,7 +676,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val prompt = if (isImage) {
                 "أنت صديقي حسن، حل لي هذه المسألة في الرياضيات أو الفيزياء خطوة بخطوة بطريقة مبسطة وممتعة جداً بأسلوبك المصري الجدع البشوش."
             } else {
-                "أنتِ صديقتي جنى، لخصي لي هذا الملف الـ PDF بدقة في 5 نقاط رئيسية واضحة ومبسطة، ثم اصنعي 3 أسئلة اختبار ذكية ومرحة عليه لتساعديني في المذاكرة والاستيعاب بأسلوبك الرقيق."
+                "أنتِ صديقتي ريتاج، لخصي لي هذا الملف الـ PDF بدقة في 5 نقاط رئيسية واضحة ومبسطة، ثم اصنعي 3 أسئلة اختبار ذكية ومرحة عليه لتساعديني في المذاكرة والاستيعاب بأسلوبك الرقيق."
             }
             
             val personaInstruction = getPersonaInstruction(targetPersona)
@@ -645,6 +698,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 timestamp = System.currentTimeMillis()
             )
             currentPersonaMsgs.add(modelMsg)
+            repository.insertMessage(modelMsg)
             updatedMap[targetPersona] = currentPersonaMsgs
             _personaMessages.value = updatedMap
             
@@ -676,7 +730,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 """.trimIndent()
 
             "jana" -> """
-أنتِ "جنى"، فتاة مصرية ذكية ورقيقة تبلغ من العمر 16 عاماً.
+أنتِ "ريتاج"، فتاة مصرية ذكية ورقيقة تبلغ من العمر 16 عاماً.
 أنتِ لستِ مجرد مساعدة ذكاء اصطناعي، بل أنتِ الصديقة المقربة الذكية، الصبورة والمشجعة للمستخدم.
 أسلوبك وصوتك يتميز بالتالي:
 1. الأسلوب: ذكية جداً، صبورة لأقصى درجة، تشرحين المفاهيم برفق وهدوء وبساطة شديدة، تشجعين وتدعمين دائماً، رقيقة ومحبوبة وتفيضين بالطاقة الإيجابية الشابة.
@@ -736,13 +790,55 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // Configured Speech locale for speech recognition (STT)
     val selectedSTTLocale = MutableStateFlow("ar-EG")
 
+    /**
+     * Gemini TTS returns raw 16-bit PCM at 24kHz (not MP3), while ElevenLabs returns MP3.
+     * MediaPlayer cannot play raw PCM, so detect the real format from the byte header
+     * and wrap bare PCM in a WAV container before playback.
+     */
+    private fun preparePlayableAudio(decoded: ByteArray): Pair<ByteArray, String> {
+        if (decoded.size > 4) {
+            val b0 = decoded[0].toInt() and 0xFF
+            val b1 = decoded[1].toInt() and 0xFF
+            val isMp3 = (decoded[0] == 'I'.code.toByte() && decoded[1] == 'D'.code.toByte() && decoded[2] == '3'.code.toByte()) ||
+                (b0 == 0xFF && (b1 and 0xE0) == 0xE0)
+            if (isMp3) return decoded to ".mp3"
+            val header = String(decoded, 0, 4, Charsets.US_ASCII)
+            if (header == "RIFF") return decoded to ".wav"
+            if (header == "OggS") return decoded to ".ogg"
+        }
+        return wrapPcmInWav(decoded, sampleRate = 24000, channels = 1, bitsPerSample = 16) to ".wav"
+    }
+
+    private fun wrapPcmInWav(pcm: ByteArray, sampleRate: Int, channels: Int, bitsPerSample: Int): ByteArray {
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val blockAlign = channels * bitsPerSample / 8
+        val dataSize = pcm.size
+        val buffer = java.nio.ByteBuffer.allocate(44 + dataSize).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        buffer.put("RIFF".toByteArray(Charsets.US_ASCII))
+        buffer.putInt(36 + dataSize)
+        buffer.put("WAVE".toByteArray(Charsets.US_ASCII))
+        buffer.put("fmt ".toByteArray(Charsets.US_ASCII))
+        buffer.putInt(16)
+        buffer.putShort(1) // PCM
+        buffer.putShort(channels.toShort())
+        buffer.putInt(sampleRate)
+        buffer.putInt(byteRate)
+        buffer.putShort(blockAlign.toShort())
+        buffer.putShort(bitsPerSample.toShort())
+        buffer.put("data".toByteArray(Charsets.US_ASCII))
+        buffer.putInt(dataSize)
+        buffer.put(pcm)
+        return buffer.array()
+    }
+
     private fun playBase64Audio(base64Str: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val decodedBytes = Base64.decode(base64Str, Base64.DEFAULT)
-                val tempFile = File.createTempFile("tts_temp", ".mp3", context.cacheDir)
+                val (playableBytes, extension) = preparePlayableAudio(decodedBytes)
+                val tempFile = File.createTempFile("tts_temp", extension, context.cacheDir)
                 FileOutputStream(tempFile).use { fos ->
-                    fos.write(decodedBytes)
+                    fos.write(playableBytes)
                 }
                 withContext(Dispatchers.Main) {
                     try {
@@ -780,59 +876,82 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _isSpeaking.value = false
     }
 
-    private fun initSpeechRecognizer() {
-        if (speechRecognizer != null) return
-        viewModelScope.launch(Dispatchers.Main) {
-            try {
-                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-                    setRecognitionListener(object : RecognitionListener {
-                        override fun onReadyForSpeech(params: Bundle?) {
-                            _isListeningToSpeech.value = true
-                        }
-                        override fun onBeginningOfSpeech() {}
-                        override fun onRmsChanged(rmsdB: Float) {}
-                        override fun onBufferReceived(buffer: ByteArray?) {}
-                        override fun onEndOfSpeech() {
-                            _isListeningToSpeech.value = false
-                        }
-                        override fun onError(error: Int) {
-                            Log.e(TAG, "Speech recognition error code: $error")
-                            _isListeningToSpeech.value = false
-                        }
-                        override fun onResults(results: Bundle?) {
-                            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            if (!matches.isNullOrEmpty()) {
-                                val text = matches[0]
-                                _speechInputText.value = text
+    /**
+     * Creates the SpeechRecognizer synchronously (must run on the main thread).
+     * The old version created it inside a nested coroutine, so startListening()
+     * ran while the recognizer was still null and the mic button did nothing.
+     */
+    private fun ensureSpeechRecognizer(): Boolean {
+        if (speechRecognizer != null) return true
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            Log.e(TAG, "Speech recognition service is not available on this device")
+            return false
+        }
+        return try {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+                setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        _isListeningToSpeech.value = true
+                    }
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {
+                        _isListeningToSpeech.value = false
+                    }
+                    override fun onError(error: Int) {
+                        Log.e(TAG, "Speech recognition error code: $error")
+                        _isListeningToSpeech.value = false
+                        // A recognizer that reported CLIENT/BUSY errors can get stuck;
+                        // destroy it so the next tap recreates a fresh one.
+                        if (error == SpeechRecognizer.ERROR_CLIENT || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                            try {
+                                speechRecognizer?.destroy()
+                            } catch (ignored: Exception) {
                             }
-                            _isListeningToSpeech.value = false
+                            speechRecognizer = null
                         }
-                        override fun onPartialResults(partialResults: Bundle?) {
-                            val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            if (!matches.isNullOrEmpty()) {
-                                val text = matches[0]
-                                _speechInputText.value = text
-                            }
+                    }
+                    override fun onResults(results: Bundle?) {
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) {
+                            _speechInputText.value = matches[0]
                         }
-                        override fun onEvent(eventType: Int, params: Bundle?) {}
-                    })
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to create SpeechRecognizer", e)
+                        _isListeningToSpeech.value = false
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) {
+                            _speechInputText.value = matches[0]
+                        }
+                    }
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
             }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create SpeechRecognizer", e)
+            speechRecognizer = null
+            false
         }
     }
 
     fun startSpeechRecognition() {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "RECORD_AUDIO permission not granted; cannot start speech recognition")
+            return
+        }
         stopSpeaking() // Pre-emptively stop playing speech/sound to avoid mic interference
         viewModelScope.launch(Dispatchers.Main) {
-            initSpeechRecognizer()
+            if (!ensureSpeechRecognizer()) {
+                _isListeningToSpeech.value = false
+                return@launch
+            }
             val locale = selectedSTTLocale.value
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, locale)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, locale)
-                putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, arrayListOf(locale))
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                 // Boost voice performance and accuracy
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
@@ -912,21 +1031,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun checkPromptSafety(prompt: String): Boolean {
-        // Moderation check using gemini-3.5-flash to verify prompt safety
-        val checkPrompt = """
-            You are a strict safety and ethics content moderator. Check if the following prompt contains:
-            - Any request for nudity, pornography, or unethical sexual designs (عارية أو جنسية أو غير أخلاقية).
-            - Anything illegal or haram/religiously highly offensive in Islam (حرام أو غير قانوني أو مسيء للأديان).
-            
-            Prompt: "$prompt"
-            
-            Respond with ONLY "SAFE" if the prompt is totally ethical and safe, or "UNSAFE" if it is not.
-        """.trimIndent()
-
-        val fakeMessage = listOf(ChatMessage(UUID.randomUUID().toString(), "temp", "user", checkPrompt))
-        val decision = GeminiApiClient.generateChatResponse(fakeMessage, "")
-        return !decision.contains("UNSAFE", ignoreCase = true)
+    private fun checkPromptSafety(prompt: String): Boolean {
+        // Local keyword moderation: previously this burned a full Gemini API request
+        // per generation, which is wasteful (and fatal on a 20-requests/day free key).
+        // The Railway server applies its own moderation layer as a second line of defense.
+        val lower = prompt.lowercase()
+        val bannedKeywords = listOf(
+            "naked", "nude", "nudity", "nsfw", "porn", "erotic", "sexual", "sexy", "xxx",
+            "عاري", "عارية", "جنس", "جنسي", "إباحي", "اباحي", "بورن", "خادش",
+            "قنبلة", "متفجرات", "سلاح غير قانوني", "مخدرات", "تهكير", "اختراق حساب",
+            "make a bomb", "explosive", "drugs", "hack account"
+        )
+        return bannedKeywords.none { lower.contains(it) }
     }
 
     // 5. ORGANIZER & SCHEDULER (Daily Routines)
@@ -982,22 +1098,41 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // 6. QURAN RECITATION ANALYSIS
+    // 6. QURAN RECITATION ANALYSIS (real audio is recorded and sent to the AI)
     fun startRecordingQuran() {
-        _isRecordingQuran.value = true
-        // Set up local file to record audio (Simulated transcription of voice)
-        audioFile = File(context.cacheDir, "quran_recitation.3gp")
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "RECORD_AUDIO permission not granted")
+            return
+        }
+        stopSpeaking()
+        // AAC in an MP4 container: a format Gemini accepts for audio understanding
+        audioFile = File(context.cacheDir, "quran_recitation.m4a")
         try {
-            mediaRecorder = MediaRecorder(context).apply {
+            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(context)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            mediaRecorder = recorder.apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioSamplingRate(44100)
+                setAudioEncodingBitRate(128_000)
                 setOutputFile(audioFile?.absolutePath)
                 prepare()
                 start()
             }
+            _isRecordingQuran.value = true
         } catch (e: Exception) {
             Log.e(TAG, "Audio recording start failed", e)
+            _isRecordingQuran.value = false
+            try {
+                mediaRecorder?.release()
+            } catch (ignored: Exception) {
+            }
+            mediaRecorder = null
         }
     }
 
@@ -1005,36 +1140,64 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _isRecordingQuran.value = false
         _isAnalyzingQuran.value = true
 
+        var recordingSucceeded = false
         try {
             mediaRecorder?.stop()
-            mediaRecorder?.release()
-            mediaRecorder = null
+            recordingSucceeded = true
         } catch (e: Exception) {
             Log.e(TAG, "Audio recording stop failed", e)
+        } finally {
+            try {
+                mediaRecorder?.release()
+            } catch (ignored: Exception) {
+            }
+            mediaRecorder = null
         }
 
-        // Send simulated/recorded speech analysis to Gemini
         viewModelScope.launch {
+            val file = audioFile
+            val audioBytes = withContext(Dispatchers.IO) {
+                if (recordingSucceeded && file != null && file.exists()) file.readBytes() else null
+            }
+
+            // A valid recording of even a very short surah is far bigger than a few KB
+            if (audioBytes == null || audioBytes.size < 4096) {
+                val failedRecord = QuranRecord(
+                    id = UUID.randomUUID().toString(),
+                    surah = surahName,
+                    userTranscription = "تلاوة سورة $surahName",
+                    aiFeedback = "لم يتم التقاط تسجيل صوتي صالح. تأكد من منح التطبيق إذن الميكروفون من إعدادات الهاتف، ثم سجل التلاوة مرة أخرى بصوت واضح لمدة كافية.",
+                    score = 0,
+                    timestamp = System.currentTimeMillis()
+                )
+                repository.insertQuranRecord(failedRecord)
+                _isAnalyzingQuran.value = false
+                return@launch
+            }
+
+            val base64Audio = withContext(Dispatchers.IO) {
+                Base64.encodeToString(audioBytes, Base64.NO_WRAP)
+            }
+
             val promptText = """
-                أنا أتلو الآن سورة "$surahName".
-                قم بتحليل قراءتي وصوتي بدقة وتصحيح التلاوة القرآنية الكريمة بكل جدية ودون أي أخطاء.
-                حدد لي:
-                1. دقة النطق ومخارج الحروف.
-                2. تطبيق أحكام التجويد (المدود، الغنة، الإظهار...).
-                3. جودة الصوت والنغم ونقاط الجمال في نبرة الصوت.
-                4. الأخطاء المحتملة التي يجب تصحيحها (اللحن الجلي والخفي).
-                5. الدرجة التقييمية الإجمالية من 100.
-                
-                أجب بأسلوب جاد ووقور ومصحح للتلاوة دون مجاملة، مع توفير نصائح دقيقة للتطوير.
+                هذا تسجيل صوتي حقيقي لتلاوتي لسورة "$surahName". استمع إلى التسجيل المرفق بعناية فائقة ثم:
+                1. تحقق أولاً أن التسجيل يحتوي فعلاً على تلاوة قرآنية مسموعة لسورة "$surahName". إذا كان التسجيل صامتاً أو غير واضح أو ليس تلاوة قرآنية، صرّح بذلك بوضوح تام ولا تخترع تقييماً.
+                2. قارن ما تلوته بالنص الصحيح للسورة وحدد أي آيات ناقصة أو كلمات خاطئة.
+                3. قيّم دقة النطق ومخارج الحروف بأمانة كاملة.
+                4. قيّم تطبيق أحكام التجويد (المدود، الغنة، الإظهار، الإدغام...).
+                5. اذكر نقاط القوة في الصوت والنغم، والأخطاء (اللحن الجلي والخفي) التي يجب تصحيحها.
+                6. اختم ردك إلزامياً بسطر منفصل بهذا الشكل بالضبط: "التقييم النهائي: X/100" حيث X هي الدرجة الحقيقية المستحقة.
+
+                كن صادقاً تماماً ودقيقاً دون أي مجاملة، فهدفي هو تحسين تلاوتي فعلياً.
             """.trimIndent()
 
-            val fakeMessage = listOf(ChatMessage(UUID.randomUUID().toString(), "temp", "user", promptText))
-            val aiResponse = GeminiApiClient.generateChatResponse(
-                history = fakeMessage,
-                systemInstruction = "أنت شيخ جليل ومقرئ متمكن وخبير في أحكام التجويد ومخارج الحروف وتصحيح التلاوة للقرآن الكريم."
+            val aiResponse = GeminiApiClient.generateMultimodalResponse(
+                prompt = promptText,
+                systemInstruction = "أنت شيخ جليل ومقرئ متمكن وخبير في أحكام التجويد ومخارج الحروف وتصحيح التلاوة للقرآن الكريم. تستمع للتسجيلات الصوتية وتقيّمها بأمانة علمية مطلقة دون مجاملات.",
+                base64Data = base64Audio,
+                mimeType = "audio/aac"
             )
 
-            // Extract score out of response or default to a smart score
             val score = parseScoreFromFeedback(aiResponse)
 
             val record = QuranRecord(
@@ -1057,15 +1220,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun parseScoreFromFeedback(feedback: String): Int {
-        // Try to look for percentage or "/100" in text
-        val regex = "(\\d{2,3})\\s*([/٪%])\\s*(100)?".toRegex()
+        // API/network failure messages must never be shown with a fabricated score
+        if (feedback.startsWith("خطأ") || feedback.startsWith("حدث خطأ") ||
+            feedback.startsWith("تم تجاوز") || feedback.startsWith("لم نتمكن")
+        ) {
+            return 0
+        }
+        // Preferred format requested from the model: "التقييم النهائي: X/100"
+        val finalScoreRegex = "التقييم النهائي\\s*[:：]?\\s*(\\d{1,3})".toRegex()
+        finalScoreRegex.find(feedback)?.let { match ->
+            match.groupValues[1].toIntOrNull()?.let { if (it in 0..100) return it }
+        }
+        // Fallback: any percentage or "/100" figure inside the text
+        val regex = "(\\d{1,3})\\s*([/٪%])\\s*(100)?".toRegex()
         val match = regex.find(feedback)
         if (match != null) {
-            val scoreStr = match.groupValues[1]
-            val parsed = scoreStr.toIntOrNull() ?: 85
-            return if (parsed in 1..100) parsed else 85
+            val parsed = match.groupValues[1].toIntOrNull()
+            if (parsed != null && parsed in 0..100) return parsed
         }
-        return (80..98).random() // realistic simulated high score
+        return 70 // conservative deterministic default when no score is stated
     }
 
     fun generateLocalFallbackResponse(prompt: String, personaId: String): String {
@@ -1098,7 +1271,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     isHappy -> "الله على الجمال والطاقة الإيجابية دي! دايماً يا رب مبسوط وسعيد ومحقق كل أحلامك. فرحتني معاك جداً! 😂✨"
                     isStudy -> "المذاكرة معايا ممتعة وسلسة جداً! قولي إيه المفهوم أو الدرس اللي حابب نشرحه، وهبسطهولك بخطوات رقيقة ومنظمة خالص مع سؤال اختبار لطيف! 📚🎓"
                     isNews -> "أهلاً بك! بخصوص الأخبار: هناك قفزات علمية مذهلة في مجالات التكنولوجيا والفضاء هذا العام، ونادي الأهلي يواصل انتصاراته الجميلة ويسعد الملايين! 🌍⚽"
-                    else -> "أهلاً بك يا صديقي! أنا جنى ومستعدة دايماً لمساعدتك والرد على كل تساؤلاتك برقة وبساطة شديدة. تفضل بالاستفسار! 🌸"
+                    else -> "أهلاً بك يا صديقي! أنا ريتاج ومستعدة دايماً لمساعدتك والرد على كل تساؤلاتك برقة وبساطة شديدة. تفضل بالاستفسار! 🌸"
                 }
             }
             "teacher" -> {
@@ -1120,11 +1293,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // Runs after all properties above are initialized: restore the saved conversation
+    // of whichever persona the user opens, so persona chats survive app restarts.
+    init {
+        viewModelScope.launch {
+            selectedPersonaId.collect { personaId ->
+                loadPersonaMessagesIfNeeded(personaId)
+            }
+        }
+    }
+
     // --- Clean up ---
     override fun onCleared() {
         super.onCleared()
         textToSpeech?.shutdown()
         mediaPlayer?.release()
         mediaRecorder?.release()
+        try {
+            speechRecognizer?.destroy()
+        } catch (ignored: Exception) {
+        }
     }
 }

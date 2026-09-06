@@ -14,6 +14,11 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.MyApplication">
+
+        <!-- AdMob Application ID: must match the AdMob console EXACTLY or the app crashes on launch -->
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-2362043522076372~8752802535" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -551,38 +551,8 @@ fun ChatScreen(viewModel: AppViewModel) {
             }
         }
 
-        // Voice Chat Quick Controller Bar (High Quality)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f))
-                .padding(horizontal = 16.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.VolumeUp,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(16.dp)
-                )
-                Text(
-                    text = "قارئ الردود التلقائي (صوت عالي الجودة)",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            }
-            Switch(
-                checked = autoReadChatEnabled,
-                onCheckedChange = { viewModel.autoReadChatEnabled.value = it },
-                modifier = Modifier.scale(0.75f)
-            )
-        }
+        // Banner Ad (replaces the old voice bar; the auto-read toggle lives in Settings)
+        BannerAdView(modifier = Modifier.fillMaxWidth())
 
         if (showThreadSelector) {
             // Dropdown list of existing sessions
@@ -1128,7 +1098,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
 
     val personasList = listOf(
         Persona("hasan", "حسن (صوت ولد)", "صاحبك الجدع - صوت ولد تفاعلي", Icons.Default.RecordVoiceOver, Color(0xFF2563EB)),
-        Persona("jana", "جنى (صوت بنت)", "صديقتك الذكية - صوت بنت رقيق", Icons.Default.Face, Color(0xFFEC4899)),
+        Persona("jana", "ريتاج (صوت بنت)", "صديقتك الذكية - صوت بنت رقيق", Icons.Default.Face, Color(0xFFEC4899)),
         Persona("teacher", "أ. أحمد", "معلم ومبسط العلوم", Icons.Default.School, Color(0xFF10B981)),
         Persona("coder", "Coder AI", "خبير البرمجة والأكواد", Icons.Default.Code, Color(0xFF14B8A6)),
         Persona("doctor", "د. خالد", "طبيب العائلة التوعوي", Icons.Default.LocalHospital, Color(0xFFEF4444)),
@@ -1245,46 +1215,8 @@ fun PersonasScreen(viewModel: AppViewModel) {
 
         Divider()
 
-        // Voice Feedback Toggle Card
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.RecordVoiceOver,
-                    contentDescription = null,
-                    tint = activePersona.color
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Column {
-                    Text(
-                        "تفعيل الصوت البشري الذكي",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        "ينطق الرد آلياً بصوت حقيقي مجسم",
-                        fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-                    )
-                }
-            }
-            Switch(
-                checked = personaVoiceEnabled,
-                onCheckedChange = {
-                    viewModel.personaVoiceEnabled.value = it
-                    if (!it) {
-                        viewModel.stopSpeaking()
-                    }
-                },
-                colors = SwitchDefaults.colors(checkedThumbColor = activePersona.color)
-            )
-        }
+        // Banner Ad (took the place of the old large voice card)
+        BannerAdView(modifier = Modifier.fillMaxWidth())
 
         // Study Mode Active Banner
         val isStudyModeActive by viewModel.isStudyModeActive.collectAsState()
@@ -1319,7 +1251,7 @@ fun PersonasScreen(viewModel: AppViewModel) {
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
                             Text(
-                                "حسن وجنى هيشرحوا بالخطوات والأمثلة مع أسئلة اختبار",
+                                "حسن وريتاج هيشرحوا بالخطوات والأمثلة مع أسئلة اختبار",
                                 fontSize = 10.sp,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
                             )
@@ -1498,6 +1430,15 @@ fun PersonasScreen(viewModel: AppViewModel) {
                 modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(24.dp),
                 maxLines = 3,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                    cursorColor = activePersona.color,
+                    focusedPlaceholderColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    focusedBorderColor = activePersona.color,
+                    unfocusedBorderColor = activePersona.color.copy(alpha = 0.7f)
+                ),
                 trailingIcon = {
                     if (textInput.isNotEmpty()) {
                         IconButton(onClick = {
@@ -2213,7 +2154,7 @@ fun VoiceSetupDialog(
                                     tint = if (selectedVoice == "jana") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                                     modifier = Modifier.size(32.dp)
                                 )
-                                Text("جنى (صوت بنت)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                Text("ريتاج (صوت بنت)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 Text("صوت أنثوي مصري رقيق", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                             }
                         }

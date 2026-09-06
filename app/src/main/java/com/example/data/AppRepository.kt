@@ -28,6 +28,10 @@ class AppRepository(private val appDao: AppDao) {
         appDao.insertMessage(message)
     }
 
+    suspend fun deleteMessagesForSession(sessionId: String) {
+        appDao.deleteMessagesForSession(sessionId)
+    }
+
     // Productivity Documents
     val allProductivityDocs: Flow<List<ProductivityDoc>> = appDao.getAllProductivityDocsFlow()
 

@@ -2,7 +2,15 @@ node_modules/
 build/
 dist/
 coverage/
+.gradle/
+.idea/
 .DS_Store
 *.log
-.env*
+.env
+.env.*
 !.env.example
+local.properties
+my-upload-key.jks
+debug.keystore
+keystore.properties
+app/build/

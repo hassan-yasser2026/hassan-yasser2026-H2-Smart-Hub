@@ -1,23 +1,11 @@
 package com.example.data
 
 import android.content.Context
-import androidx.room.Database
-import androidx.room.Room
-import androidx.room.RoomDatabase
 
-@Database(
-    entities = [
-        ChatSession::class,
-        ChatMessage::class,
-        ProductivityDoc::class,
-        UserSchedule::class,
-        QuranRecord::class
-    ],
-    version = 1,
-    exportSchema = false
-)
-abstract class AppDatabase : RoomDatabase() {
-    abstract fun appDao(): AppDao
+class AppDatabase private constructor(context: Context) {
+    private val appDaoInstance = PersistentAppDao(context)
+
+    fun appDao(): AppDao = appDaoInstance
 
     companion object {
         @Volatile
@@ -25,13 +13,7 @@ abstract class AppDatabase : RoomDatabase() {
 
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
-                val instance = Room.databaseBuilder(
-                    context.applicationContext,
-                    AppDatabase::class.java,
-                    "h2hub_database"
-                )
-                .fallbackToDestructiveMigration()
-                .build()
+                val instance = AppDatabase(context.applicationContext)
                 INSTANCE = instance
                 instance
             }
